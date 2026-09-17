@@ -12,11 +12,15 @@ the bottom of this file for the pattern to follow.
 """
 
 import os
+import threading
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Piyush Mhatre — Portfolio Backend", version="0.1.0")
+from routers import stock_analysis
+
+app = FastAPI(title="Piyush Mhatre — Portfolio Backend", version="0.2.0")
+app.include_router(stock_analysis.router)
 
 # =====================================================================
 # CORS — only these origins are allowed to call this API from a browser.
@@ -176,6 +180,36 @@ def root():
     """Simple root route so visiting the base URL doesn't 404 — also
     useful as the target for an uptime-pinger (see backend README)."""
     return {"status": "ok", "service": "piyush-portfolio-backend"}
+
+
+@app.on_event("startup")
+def prewarm_forecast_engine():
+    """Equivalent of the original app's 'start loading the model as soon
+    as the landing page is opened' behavior — adapted for how this is
+    actually deployed. On Render's free tier, the process only *starts*
+    when something wakes it from a cold sleep — and that wake-up is
+    exactly what the portfolio's warmup.js ping triggers the moment a
+    visitor lands on any page. So "on server startup" here already lines
+    up with "as soon as the portfolio is visited," without needing any
+    separate mechanism.
+
+    This only does anything if FORECAST_ENGINE=prophet is set — Prophet's
+    own import is the expensive part (it initializes its Stan/cmdstanpy
+    backend), so doing that import once here, in a background thread,
+    means it's already paid for by the time a real /analyze request
+    arrives, instead of the first visitor eating that cost.
+    """
+    if os.environ.get("FORECAST_ENGINE", "trend").lower() != "prophet":
+        return  # lightweight engine active — nothing heavy to pre-load
+
+    def _warm():
+        try:
+            from prophet import Prophet  # noqa: F401 — import side-effect is the point
+            print("Prophet pre-imported at startup (FORECAST_ENGINE=prophet)")
+        except Exception as e:
+            print(f"Prophet pre-warm failed: {e}")
+
+    threading.Thread(target=_warm, daemon=True).start()
 
 
 @app.get("/health")

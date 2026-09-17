@@ -1,3 +1,16 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.9.2
+
+# --- stock analysis feature ---
+yfinance==0.2.43
+pandas==2.2.3
+numpy==1.26.4
+plotly==5.24.1
+requests==2.32.3
+
+# Prophet is listed so the FORECAST_ENGINE=prophet switch works without a
+# redeploy — but it is only ever imported if that env var is set, so it
+# costs disk/build time, not runtime RAM, while FORECAST_ENGINE=trend
+# (the default) is active.
+prophet==1.1.6
