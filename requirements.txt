@@ -13,4 +13,4 @@ requests==2.32.3
 # redeploy — but it is only ever imported if that env var is set, so it
 # costs disk/build time, not runtime RAM, while FORECAST_ENGINE=trend
 # (the default) is active.
-prophet==1.1.6
+prophet==1.4.0

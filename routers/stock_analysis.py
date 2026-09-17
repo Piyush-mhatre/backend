@@ -551,30 +551,49 @@ def analyze_candlestick_and_info(stock, history_df, ticker):
 # Sector performance (Financial Modeling Prep)
 # =====================================================================
 def analyze_sector_performance(stock, ticker):
+
     try:
         stock_info = stock.info
+
         sector = stock_info.get("sector", "N/A")
         industry = stock_info.get("industry", "N/A")
         company_name = stock_info.get("shortName", ticker)
 
         if sector == "N/A":
-            return {"success": False, "error": f"Sector information not available for {ticker}"}
+            return {
+                "success": False,
+                "error": f"Sector information not available for {ticker}"
+            }
 
         api_key = os.environ.get("FMP_API_KEY")
-        if not api_key:
-            return {"success": False, "error": "FMP_API_KEY is not configured on the server"}
 
-        # Corrected endpoint — FMP's current docs show this path (singular
-        # "sector-performance", no "/stock/" prefix); the original app's
-        # URL used an older/incorrect path.
-        url = f"https://financialmodelingprep.com/api/v3/sector-performance?apikey={api_key}"
+        if not api_key:
+            return {
+                "success": False,
+                "error": "FMP_API_KEY is not configured on the server"
+            }
+
+        # FMP Stable API endpoint
+        url = "https://financialmodelingprep.com/stable/sector-performance-snapshot"
+
+        params = {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "apikey": api_key
+        }
+
         try:
-            response = requests.get(url, timeout=10)
+            response = requests.get(
+                url,
+                params=params,
+                timeout=10
+            )
+
             response.raise_for_status()
             sector_data = response.json()
 
-        except requests.exceptions.HTTPError as e:
+        except requests.exceptions.HTTPError:
             print(f"FMP HTTP error: {response.status_code}")
+
             return {
                 "success": False,
                 "error": f"FMP API request failed with status {response.status_code}."
@@ -582,58 +601,105 @@ def analyze_sector_performance(stock, ticker):
 
         except requests.exceptions.RequestException as e:
             print(f"FMP request error: {type(e).__name__}")
+
             return {
                 "success": False,
                 "error": "Failed to connect to the sector performance service."
             }
 
-        # Defensive parsing: handle either a flat list response or a dict
-        # wrapping the list under "sectorPerformance" — FMP's exact
-        # response shape has shifted across API versions.
+        # FMP currently returns a list of sector performance objects.
+        # Keep defensive handling in case the response is wrapped in a dictionary.
         if isinstance(sector_data, list):
             raw_entries = sector_data
+
         elif isinstance(sector_data, dict):
             raw_entries = sector_data.get("sectorPerformance", [])
+
         else:
             raw_entries = []
 
         sector_performance = None
         sector_performances = []
+
         for entry in raw_entries:
+
             try:
                 sector_name = entry.get("sector")
-                raw_change = entry.get("changesPercentage", entry.get("changePercentage"))
+
+                # Current FMP Stable endpoint uses "averageChange"
+                raw_change = entry.get("averageChange")
+
                 if raw_change is None:
                     continue
-                change_percentage = float(str(raw_change).replace("%", ""))
-                sector_performances.append({"sector": sector_name, "change_percentage": change_percentage})
+
+                change_percentage = float(raw_change)
+
+                sector_performances.append({
+                    "sector": sector_name,
+                    "change_percentage": change_percentage
+                })
+
                 if sector_name == sector:
-                    sector_performance = {"sector": sector_name, "change_percentage": change_percentage}
-            except (KeyError, ValueError, AttributeError):
+                    sector_performance = {
+                        "sector": sector_name,
+                        "change_percentage": change_percentage
+                    }
+
+            except (KeyError, ValueError, TypeError, AttributeError):
                 continue
 
         if not sector_performance:
-            return {"success": False, "error": f"No performance data found for the {sector} sector."}
+            return {
+                "success": False,
+                "error": f"No performance data found for the {sector} sector."
+            }
 
-        explanation = f"The {sector} sector, which {company_name} operates in, has "
+        explanation = (
+            f"The {sector} sector, which {company_name} operates in, has "
+        )
+
         if sector_performance["change_percentage"] > 0:
-            explanation += f"increased by {sector_performance['change_percentage']:.2f}% recently. "
+
+            explanation += (
+                f"increased by "
+                f"{sector_performance['change_percentage']:.2f}% recently. "
+            )
+
         elif sector_performance["change_percentage"] < 0:
-            explanation += f"decreased by {abs(sector_performance['change_percentage']):.2f}% recently. "
+
+            explanation += (
+                f"decreased by "
+                f"{abs(sector_performance['change_percentage']):.2f}% recently. "
+            )
+
         else:
+
             explanation += "shown no significant change recently. "
 
         if sector_performances:
-            sorted_sectors = sorted(sector_performances, key=lambda x: x["change_percentage"], reverse=True)
+
+            sorted_sectors = sorted(
+                sector_performances,
+                key=lambda x: x["change_percentage"],
+                reverse=True
+            )
+
             top_sector = sorted_sectors[0]
             bottom_sector = sorted_sectors[-1]
+
             explanation += (
-                f"The best performing sector is {top_sector['sector']} with a "
-                f"{top_sector['change_percentage']:.2f}% change, while the worst performing sector is "
-                f"{bottom_sector['sector']} with a {bottom_sector['change_percentage']:.2f}% change."
+                f"The best performing sector is "
+                f"{top_sector['sector']} with a "
+                f"{top_sector['change_percentage']:.2f}% change, "
+                f"while the worst performing sector is "
+                f"{bottom_sector['sector']} with a "
+                f"{bottom_sector['change_percentage']:.2f}% change."
             )
+
         else:
-            top_sector = bottom_sector = None
+
+            top_sector = None
+            bottom_sector = None
 
         return {
             "success": True,
@@ -642,12 +708,21 @@ def analyze_sector_performance(stock, ticker):
             "sector": sector,
             "industry": industry,
             "sector_performance": sector_performance,
-            "sector_comparison": {"top_sector": top_sector, "bottom_sector": bottom_sector},
+            "sector_comparison": {
+                "top_sector": top_sector,
+                "bottom_sector": bottom_sector
+            },
             "explanation": explanation,
         }
+
     except Exception as e:
+
         traceback.print_exc()
-        return {"success": False, "error": str(e)}
+
+        return {
+            "success": False,
+            "error": "An unexpected error occurred while analyzing sector performance."
+        }
 
 
 # =====================================================================
