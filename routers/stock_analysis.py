@@ -572,8 +572,20 @@ def analyze_sector_performance(stock, ticker):
             response = requests.get(url, timeout=10)
             response.raise_for_status()
             sector_data = response.json()
+
+        except requests.exceptions.HTTPError as e:
+            print(f"FMP HTTP error: {response.status_code}")
+            return {
+                "success": False,
+                "error": f"FMP API request failed with status {response.status_code}."
+            }
+
         except requests.exceptions.RequestException as e:
-            return {"success": False, "error": f"Failed to fetch sector performance data: {str(e)}"}
+            print(f"FMP request error: {type(e).__name__}")
+            return {
+                "success": False,
+                "error": "Failed to connect to the sector performance service."
+            }
 
         # Defensive parsing: handle either a flat list response or a dict
         # wrapping the list under "sectorPerformance" — FMP's exact
