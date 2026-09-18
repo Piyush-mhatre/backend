@@ -434,6 +434,13 @@ def forecast_stock(stock, history_df, ticker):
 def analyze_candlestick_and_info(stock, history_df, ticker):
     try:
         stock_info = stock.info
+
+        print("========== YFINANCE INFO DEBUG ==========")
+        print("YFINANCE INFO KEYS:", list(stock_info.keys()))
+        print("YFINANCE SECTOR:", stock_info.get("sector"))
+        print("YFINANCE INDUSTRY:", stock_info.get("industry"))
+        print("=========================================")
+
         company_name = stock_info.get("shortName", ticker)
         currency = stock_info.get("currency", "USD")
         historical_data = history_df
@@ -555,6 +562,12 @@ def analyze_sector_performance(stock, ticker):
 
     try:
         stock_info = stock.info
+
+        print("========== SECTOR INFO DEBUG ==========")
+        print("SECTOR INFO KEYS:", list(stock_info.keys()))
+        print("SECTOR:", stock_info.get("sector"))
+        print("INDUSTRY:", stock_info.get("industry"))
+        print("=======================================")
 
         sector = stock_info.get("sector", "N/A")
         industry = stock_info.get("industry", "N/A")
