@@ -52,6 +52,39 @@ router = APIRouter()
 # site. 5 years keeps the chart meaningful while cutting that dramatically.
 HISTORY_PERIOD = "5y"
 
+def get_fmp_company_profile(ticker):
+    """Fetch company profile information from Financial Modeling Prep."""
+    api_key = os.environ.get("FMP_API_KEY")
+
+    if not api_key:
+        return None
+
+    url = "https://financialmodelingprep.com/stable/profile"
+
+    params = {
+        "symbol": ticker,
+        "apikey": api_key
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+
+        if response.status_code != 200:
+            print(f"FMP profile request failed: HTTP {response.status_code}")
+            return None
+
+        data = response.json()
+
+        if not isinstance(data, list) or not data:
+            print(f"FMP profile returned no data for {ticker}")
+            return None
+
+        return data[0]
+
+    except Exception as e:
+        print(f"FMP profile request error: {type(e).__name__}")
+        return None
+
 
 # =====================================================================
 # Piotroski F-Score
@@ -434,15 +467,10 @@ def forecast_stock(stock, history_df, ticker):
 def analyze_candlestick_and_info(stock, history_df, ticker):
     try:
         stock_info = stock.info
+        fmp_profile = get_fmp_company_profile(ticker) or {}
 
-        print("========== YFINANCE INFO DEBUG ==========")
-        print("YFINANCE INFO KEYS:", list(stock_info.keys()))
-        print("YFINANCE SECTOR:", stock_info.get("sector"))
-        print("YFINANCE INDUSTRY:", stock_info.get("industry"))
-        print("=========================================")
-
-        company_name = stock_info.get("shortName", ticker)
-        currency = stock_info.get("currency", "USD")
+        company_name = fmp_profile.get("companyName") or stock_info.get("shortName", ticker)
+        currency = fmp_profile.get("currency") or stock_info.get("currency", "USD")
         historical_data = history_df
 
         fig = go.Figure(data=[go.Candlestick(
@@ -458,10 +486,10 @@ def analyze_candlestick_and_info(stock, history_df, ticker):
         )
 
         filtered_info = {
-            "Country": stock_info.get("country", "N/A"),
-            "Website": stock_info.get("website", "N/A"),
-            "Industry": stock_info.get("industry", "N/A"),
-            "Business Summary": stock_info.get("longBusinessSummary", "N/A"),
+            "Country": fmp_profile.get("country") or stock_info.get("country", "N/A"),
+            "Website": fmp_profile.get("website") or stock_info.get("website", "N/A"),
+            "Industry": fmp_profile.get("industry") or stock_info.get("industry", "N/A"),
+            "Business Summary": fmp_profile.get("description") or stock_info.get("longBusinessSummary", "N/A"),
             "Recommendation": stock_info.get("recommendationKey", "N/A").upper(),
         }
 
@@ -562,16 +590,11 @@ def analyze_sector_performance(stock, ticker):
 
     try:
         stock_info = stock.info
+        fmp_profile = get_fmp_company_profile(ticker) or {}
 
-        print("========== SECTOR INFO DEBUG ==========")
-        print("SECTOR INFO KEYS:", list(stock_info.keys()))
-        print("SECTOR:", stock_info.get("sector"))
-        print("INDUSTRY:", stock_info.get("industry"))
-        print("=======================================")
-
-        sector = stock_info.get("sector", "N/A")
-        industry = stock_info.get("industry", "N/A")
-        company_name = stock_info.get("shortName", ticker)
+        sector = fmp_profile.get("sector") or stock_info.get("sector", "N/A")
+        industry = fmp_profile.get("industry") or stock_info.get("industry", "N/A")
+        company_name = fmp_profile.get("companyName") or stock_info.get("shortName", ticker)
 
         if sector == "N/A":
             return {
@@ -813,3 +836,10 @@ def analyze(payload: StockAnalyzeRequest):
         "sector": sector_results,
     }
     return _sanitize_for_json(result)
+
+
+if __name__ == "__main__":
+    profile = get_fmp_company_profile("AAPL")
+    print("\n========== TEST RESULT ==========")
+    print(profile)
+    print("=================================")
