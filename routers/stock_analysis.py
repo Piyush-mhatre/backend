@@ -29,6 +29,7 @@ needs to know or care which one produced a given forecast.
 
 import os
 import json
+import math
 import traceback
 from datetime import datetime
 
@@ -283,7 +284,7 @@ def _lightweight_trend_forecast(history_df, company_name, ticker, currency):
     future_dates = pd.date_range(dfx["ds"].iloc[-1] + pd.Timedelta(days=1), periods=future_periods)
     future_values = slope * future_x + intercept
 
-    daily_returns = dfx["y"].pct_change().dropna()
+    daily_returns = dfx["y"].pct_change(fill_method=None).dropna()
     daily_vol = daily_returns.std()
     days_out = np.arange(1, future_periods + 1)
     band_width = dfx["y"].iloc[-1] * daily_vol * np.sqrt(days_out) * 1.96  # ~95% band
@@ -466,7 +467,7 @@ def analyze_candlestick_and_info(stock, history_df, ticker):
             long_term_idx = -252 if len(historical_data) >= 252 else 0
             long_term_return = ((historical_data.iloc[-1].Close / historical_data.iloc[long_term_idx].Close) - 1) * 100
 
-            recent_returns = historical_data.iloc[-30:].Close.pct_change().dropna()
+            recent_returns = historical_data.iloc[-30:].Close.pct_change(fill_method=None).dropna()
             volatility = recent_returns.std() * 100
 
             recent_closes = historical_data.iloc[-10:].Close
@@ -726,6 +727,31 @@ def analyze_sector_performance(stock, ticker):
 
 
 # =====================================================================
+# JSON safety net
+# =====================================================================
+def _sanitize_for_json(value):
+    """Recursively replace NaN/Infinity floats with None (JSON null).
+
+    Starlette's default JSONResponse sets allow_nan=False (unlike plain
+    Python json.dumps), so a single stray NaN or Infinity anywhere in a
+    nested response — common with real-world financial data: gaps,
+    incomplete trading days, 0/0 ratios — causes a hard 500 instead of a
+    clean response with one missing value. This walks the whole payload
+    once at the response boundary and closes that entire class of bug,
+    regardless of which specific calculation produced the bad value.
+    """
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_json(v) for v in value]
+    return value
+
+
+# =====================================================================
 # ROUTE
 # =====================================================================
 class StockAnalyzeRequest(BaseModel):
@@ -750,6 +776,14 @@ def analyze(payload: StockAnalyzeRequest):
         if history_df.empty:
             raise HTTPException(status_code=404, detail=f"No data found for ticker '{ticker}'")
 
+        # yfinance occasionally returns a NaN row for the most recent day
+        # (an in-progress/incomplete trading session) — drop it here so a
+        # bad last row can never poison every downstream calculation that
+        # reads "the latest price" (forecast, candlestick, etc.).
+        history_df = history_df.dropna(subset=["Open", "High", "Low", "Close"])
+        if history_df.empty:
+            raise HTTPException(status_code=404, detail=f"No usable price data for ticker '{ticker}'")
+
         piotroski_results = analyze_piotroski(stock, ticker)
         forecast_results = forecast_stock(stock, history_df, ticker)
         candlestick_results = analyze_candlestick_and_info(stock, history_df, ticker)
@@ -759,9 +793,10 @@ def analyze(payload: StockAnalyzeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return {
+    result = {
         "piotroski": piotroski_results,
         "prophet": forecast_results,  # key name kept as "prophet" for frontend compatibility, regardless of engine used
         "candlestick": candlestick_results,
         "sector": sector_results,
     }
+    return _sanitize_for_json(result)
