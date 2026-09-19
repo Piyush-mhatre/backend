@@ -31,7 +31,7 @@ import os
 import json
 import math
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 from fastapi import APIRouter, HTTPException
@@ -673,35 +673,62 @@ def analyze_sector_performance(stock, ticker):
         # FMP Stable API endpoint
         url = "https://financialmodelingprep.com/stable/sector-performance-snapshot"
 
-        params = {
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "apikey": api_key
-        }
+        today = datetime.now()
 
-        try:
-            response = requests.get(
-                url,
-                params=params,
-                timeout=10
-            )
+        sector_data = None
 
-            response.raise_for_status()
-            sector_data = response.json()
+        # Try today and the previous 5 days.
+        # This handles weekends and market holidays.
+        for days_back in range(6):
 
-        except requests.exceptions.HTTPError:
-            print(f"FMP HTTP error: {response.status_code}")
+            candidate_date = (
+                today - timedelta(days=days_back)
+            ).strftime("%Y-%m-%d")
 
-            return {
-                "success": False,
-                "error": f"FMP API request failed with status {response.status_code}."
+            params = {
+                "date": candidate_date,
+                "apikey": api_key
             }
 
-        except requests.exceptions.RequestException as e:
-            print(f"FMP request error: {type(e).__name__}")
+            try:
+                response = requests.get(
+                    url,
+                    params=params,
+                    timeout=5
+                )
 
+                response.raise_for_status()
+
+                data = response.json()
+
+                # FMP returns a non-empty list when data is available.
+                if isinstance(data, list) and data:
+                    sector_data = data
+                    break
+
+                # Defensive handling if FMP wraps the data in a dictionary.
+                if isinstance(data, dict) and data.get("sectorPerformance"):
+                    sector_data = data
+                    break
+
+            except requests.exceptions.HTTPError:
+                print(
+                    f"FMP HTTP error for {candidate_date}: "
+                    f"{response.status_code}"
+                )
+                continue
+
+            except requests.exceptions.RequestException as e:
+                print(
+                    f"FMP request error for {candidate_date}: "
+                    f"{type(e).__name__}"
+                )
+                continue
+
+        if sector_data is None:
             return {
                 "success": False,
-                "error": "Failed to connect to the sector performance service."
+                "error": "No recent sector performance data available from FMP."
             }
 
         # FMP currently returns a list of sector performance objects.
