@@ -4,6 +4,8 @@ __pycache__/
 .env
 keys.txt
 venv/
-models/
+
 models/*.pt
+models/*.onnx
+
 export_full_quantized_model.py
