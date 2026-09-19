@@ -2,8 +2,9 @@ import os
 import random
 import threading
 
+import numpy as np
 import requests
-import torch
+import onnxruntime as ort
 from fastapi import APIRouter, HTTPException
 from transformers import AutoTokenizer
 
@@ -16,18 +17,25 @@ router = APIRouter(
 # Configuration
 # ============================================================
 
-MODEL_NAME = "ProsusAI/finbert"
+# Local tokenizer files (committed directly to git — small, no Release
+# needed) instead of AutoTokenizer.from_pretrained("ProsusAI/finbert"),
+# so boot never needs a Hugging Face network call at all.
+TOKENIZER_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "models",
+    "tokenizer"
+)
 
-# Points at the fully pre-quantized model object (see
-# export_full_quantized_model.py, run once locally) — NOT a state_dict.
-# This is the whole point of the change: the server no longer rebuilds
-# the fp32 architecture and re-quantizes it on every boot, which was the
-# ~440MB+ memory spike causing repeated OOM crashes on Render's 512MB
-# free tier. It just loads the already-quantized tensors directly.
+# ONNX Runtime, INT8-quantized (see export_to_onnx.py, run once locally).
+# This replaces the old torch-based model entirely — onnxruntime's own
+# import footprint is roughly 10x smaller than torch's, which is what
+# was causing OOM crashes on Render's 512MB free tier even after every
+# quantization-level fix (torch's runtime — libtorch/MKL/OpenMP — costs
+# 200-300MB just by existing in the process, independent of model size).
 MODEL_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "models",
-    "finbert_int8_full.pt"
+    "finbert_int8.onnx"
 )
 
 API_KEY = os.environ.get("NEWS_API_KEY")
@@ -55,7 +63,7 @@ PREFERRED_DOMAINS = []  # e.g. ["reuters.com", "moneycontrol.com", "livemint.com
 # ============================================================
 
 tokenizer = None
-model = None
+model = None  # an onnxruntime.InferenceSession once loaded
 
 model_loading = False
 model_ready = False
@@ -75,7 +83,7 @@ ID_TO_SENTIMENT = {
 
 
 # ============================================================
-# Load INT8 FinBERT
+# Load INT8 FinBERT (ONNX Runtime)
 # ============================================================
 
 def load_finbert_model():
@@ -92,39 +100,42 @@ def load_finbert_model():
     print("Loading INT8 FinBERT model...")
 
     try:
-        # Tokenizer is just vocab + config, a few hundred KB — fine to
-        # pull from Hugging Face on every cold start.
-        print("Loading FinBERT tokenizer...")
+        # Load from local files committed to the repo — no Hugging Face
+        # network call at boot at all (this used to hit HF for the
+        # tokenizer every cold start; now it's just reading small local
+        # files, one less thing that can rate-limit or fail).
+        print("Loading FinBERT tokenizer (local files)...")
 
         tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_NAME
+            TOKENIZER_DIR
         )
 
-        # Load the WHOLE pre-quantized model object directly — no fp32
-        # architecture build, no quantize_dynamic call, at boot time.
-        # That entire step now happens once, locally, in
-        # export_full_quantized_model.py, and the result is just loaded
-        # here. This is what removes the memory spike that was crashing
-        # the app on Render's 512MB free tier.
-        #
-        # weights_only=False is required here (unlike the old state_dict
-        # load) because this file is a pickled model object, not just
-        # tensors — that's normally a security tradeoff for untrusted
-        # files, but this one is a file you built yourself and control
-        # end-to-end via your own GitHub Release, so it's fine.
-        print("Loading pre-quantized INT8 FinBERT model...")
+        # Load the ONNX Runtime session directly — no torch, no fp32
+        # architecture build, no quantize_dynamic call. onnxruntime's own
+        # import/runtime footprint is roughly 10x smaller than torch's,
+        # which is the actual fix for the OOM crashes: torch's runtime
+        # (libtorch/MKL/OpenMP) costs 200-300MB just by existing in the
+        # process, independent of model size, and no amount of
+        # quantizing the model itself could get under that floor.
+        print("Loading pre-quantized INT8 FinBERT ONNX model...")
 
-        model = torch.load(
+        session_options = ort.SessionOptions()
+        # Free tier has limited CPU too — keep thread pools small so
+        # onnxruntime doesn't spin up more worker threads than useful,
+        # which costs both memory and contention with FastAPI's own
+        # request handling.
+        session_options.intra_op_num_threads = 1
+        session_options.inter_op_num_threads = 1
+
+        model = ort.InferenceSession(
             MODEL_PATH,
-            map_location="cpu",
-            weights_only=False
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"]
         )
-
-        model.eval()
 
         model_ready = True
 
-        print("INT8 FinBERT model loaded successfully!")
+        print("INT8 FinBERT (ONNX) model loaded successfully!")
 
     except Exception as e:
         model_ready = False
@@ -159,20 +170,16 @@ def predict_sentiment(text):
             padding="max_length",
             truncation=True,
             return_attention_mask=True,
-            return_tensors="pt"
+            return_tensors="np"
         )
 
-        with torch.no_grad():
+        ort_inputs = {
+            "input_ids": encoded["input_ids"].astype(np.int64),
+            "attention_mask": encoded["attention_mask"].astype(np.int64),
+        }
 
-            output = model(
-                input_ids=encoded["input_ids"],
-                attention_mask=encoded["attention_mask"]
-            )
-
-            prediction = torch.argmax(
-                output.logits,
-                dim=1
-            ).item()
+        logits = model.run(["logits"], ort_inputs)[0]
+        prediction = int(np.argmax(logits, axis=1)[0])
 
         result = ID_TO_SENTIMENT.get(
             prediction,
@@ -385,7 +392,7 @@ def get_news(keyword: str):
 def model_status():
 
     return {
-        "model": MODEL_NAME,
+        "model": "ProsusAI/finbert (ONNX INT8)",
         "quantization": "INT8",
         "ready": model_ready,
         "loading": model_loading
