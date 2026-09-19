@@ -6,3 +6,4 @@ keys.txt
 venv/
 models/
 models/*.pt
+export_full_quantized_model.py

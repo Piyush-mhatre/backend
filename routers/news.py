@@ -5,7 +5,7 @@ import threading
 import requests
 import torch
 from fastapi import APIRouter, HTTPException
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
+from transformers import AutoTokenizer
 
 router = APIRouter(
     prefix="/news",
@@ -18,10 +18,16 @@ router = APIRouter(
 
 MODEL_NAME = "ProsusAI/finbert"
 
+# Points at the fully pre-quantized model object (see
+# export_full_quantized_model.py, run once locally) — NOT a state_dict.
+# This is the whole point of the change: the server no longer rebuilds
+# the fp32 architecture and re-quantizes it on every boot, which was the
+# ~440MB+ memory spike causing repeated OOM crashes on Render's 512MB
+# free tier. It just loads the already-quantized tensors directly.
 MODEL_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "models",
-    "finbert_int8.pt"
+    "finbert_int8_full.pt"
 )
 
 API_KEY = os.environ.get("NEWS_API_KEY")
@@ -94,50 +100,25 @@ def load_finbert_model():
             MODEL_NAME
         )
 
-        # Build the FinBERT architecture from config only — this does
-        # NOT download the ~440MB pretrained weights. The model comes
-        # out with random weights, which is fine because we immediately
-        # overwrite every one of them with our own quantized state_dict
-        # below.
-        print("Creating FinBERT architecture (config only, no weight download)...")
+        # Load the WHOLE pre-quantized model object directly — no fp32
+        # architecture build, no quantize_dynamic call, at boot time.
+        # That entire step now happens once, locally, in
+        # export_full_quantized_model.py, and the result is just loaded
+        # here. This is what removes the memory spike that was crashing
+        # the app on Render's 512MB free tier.
+        #
+        # weights_only=False is required here (unlike the old state_dict
+        # load) because this file is a pickled model object, not just
+        # tensors — that's normally a security tradeoff for untrusted
+        # files, but this one is a file you built yourself and control
+        # end-to-end via your own GitHub Release, so it's fine.
+        print("Loading pre-quantized INT8 FinBERT model...")
 
-        config = AutoConfig.from_pretrained(MODEL_NAME)
-        model = AutoModelForSequenceClassification.from_config(config)
-
-        model.eval()
-
-        # Apply dynamic INT8 quantization — this must happen BEFORE
-        # load_state_dict, since quantization changes module structure
-        # (Linear -> DynamicQuantizedLinear) and our saved state_dict's
-        # keys/shapes match the quantized structure, not the plain one.
-        print("Applying INT8 quantization...")
-
-        # inplace=True avoids quantize_dynamic's default behavior of
-        # deep-copying the whole fp32 model before converting it — on a
-        # ~110M-param BERT model that default copy briefly doubles RAM
-        # (~440MB -> ~880MB) at exactly the moment this runs, which is
-        # almost certainly what's tipping Render's 512MB free tier over
-        # the edge. inplace=True quantizes each Linear layer in place
-        # instead, so peak usage stays close to the single-copy size.
-        model = torch.quantization.quantize_dynamic(
-            model,
-            {torch.nn.Linear},
-            dtype=torch.qint8,
-            inplace=True
-        )
-
-        # Load our saved INT8 weights (downloaded from the GitHub Release
-        # asset into MODEL_PATH by Render's build command — see backend
-        # README / render build command).
-        print("Loading local INT8 weights...")
-
-        state_dict = torch.load(
+        model = torch.load(
             MODEL_PATH,
             map_location="cpu",
-            weights_only=True
+            weights_only=False
         )
-
-        model.load_state_dict(state_dict)
 
         model.eval()
 
