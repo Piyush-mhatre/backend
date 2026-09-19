@@ -626,12 +626,35 @@ def analyze_candlestick_and_info(stock, history_df, ticker):
 def analyze_sector_performance(stock, ticker):
 
     try:
-        stock_info = stock.info
+        # FMP is the primary source and doesn't hit Yahoo's crumb/rate
+        # limiting at all — check it first, and only fall back to
+        # yfinance's .info (which does) if FMP is missing something.
         fmp_profile = get_fmp_company_profile(ticker) or {}
 
-        sector = fmp_profile.get("sector") or stock_info.get("sector", "N/A")
-        industry = fmp_profile.get("industry") or stock_info.get("industry", "N/A")
-        company_name = fmp_profile.get("companyName") or stock_info.get("shortName", ticker)
+        sector = fmp_profile.get("sector", "N/A")
+        industry = fmp_profile.get("industry", "N/A")
+        company_name = fmp_profile.get("companyName", ticker)
+
+        if sector == "N/A" or industry == "N/A" or company_name == ticker:
+            # yfinance's .info property triggers Yahoo's "crumb" check,
+            # which has gotten aggressive about rate-limiting cloud/
+            # datacenter IPs — exactly what Render's free tier is. Treat
+            # this purely as a best-effort fallback: if it fails, keep
+            # whatever FMP already gave us instead of failing the whole
+            # request over a Yahoo-side 401/429 that has nothing to do
+            # with this ticker or the rest of the app.
+            try:
+                stock_info = stock.info
+            except Exception as e:
+                print(f"yfinance .info fallback failed (likely Yahoo crumb/rate-limit): {e}")
+                stock_info = {}
+
+            if sector == "N/A":
+                sector = stock_info.get("sector", "N/A")
+            if industry == "N/A":
+                industry = stock_info.get("industry", "N/A")
+            if company_name == ticker:
+                company_name = stock_info.get("shortName", ticker)
 
         if sector == "N/A":
             return {
