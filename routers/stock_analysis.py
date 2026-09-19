@@ -33,17 +33,54 @@ import math
 import traceback
 from datetime import datetime
 
-import numpy as np
-import pandas as pd
 import requests
-import yfinance as yf
-import plotly
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 router = APIRouter()
+
+# =====================================================================
+# Lazy-loaded heavy dependencies
+#
+# numpy/pandas/yfinance/plotly (and, transitively, matplotlib via
+# plotly's renderer detection) are NOT imported at module level anymore.
+# Previously they loaded the instant this router was imported by
+# main.py — i.e. on every single app boot, regardless of whether anyone
+# ever calls /analyze — which meant they were competing for RAM with
+# FinBERT's model construction in routers/news.py during the exact same
+# startup window. Deferring them to first real use means the two heavy
+# feature stacks no longer race each other for Render's 512MB free-tier
+# ceiling during cold start.
+#
+# Everything below still refers to `np`, `pd`, `yf`, `plotly`, `go`,
+# `make_subplots` as plain module-level names elsewhere in this file —
+# that still works because Python looks up globals at call time, not at
+# import time, so as long as _ensure_heavy_libs() has run before any of
+# those functions are actually invoked (it's called at the top of the
+# /analyze route below), nothing else in this file needs to change.
+# =====================================================================
+np = None
+pd = None
+yf = None
+plotly = None
+go = None
+make_subplots = None
+_heavy_libs_loaded = False
+
+
+def _ensure_heavy_libs():
+    global np, pd, yf, plotly, go, make_subplots, _heavy_libs_loaded
+    if _heavy_libs_loaded:
+        return
+    import numpy as _np
+    import pandas as _pd
+    import yfinance as _yf
+    import plotly as _plotly
+    import plotly.graph_objects as _go
+    from plotly.subplots import make_subplots as _make_subplots
+
+    np, pd, yf, plotly, go, make_subplots = _np, _pd, _yf, _plotly, _go, _make_subplots
+    _heavy_libs_loaded = True
 
 # How much price history to pull for the candlestick chart and the trend/
 # Prophet forecast. The original app fetched candlestick data all the way
@@ -796,6 +833,8 @@ class StockAnalyzeRequest(BaseModel):
 
 @router.post("/analyze")
 def analyze(payload: StockAnalyzeRequest):
+    _ensure_heavy_libs()
+
     ticker = payload.ticker.strip().upper()
     if not ticker:
         raise HTTPException(status_code=400, detail="No ticker provided")

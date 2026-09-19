@@ -112,10 +112,18 @@ def load_finbert_model():
         # keys/shapes match the quantized structure, not the plain one.
         print("Applying INT8 quantization...")
 
+        # inplace=True avoids quantize_dynamic's default behavior of
+        # deep-copying the whole fp32 model before converting it — on a
+        # ~110M-param BERT model that default copy briefly doubles RAM
+        # (~440MB -> ~880MB) at exactly the moment this runs, which is
+        # almost certainly what's tipping Render's 512MB free tier over
+        # the edge. inplace=True quantizes each Linear layer in place
+        # instead, so peak usage stays close to the single-copy size.
         model = torch.quantization.quantize_dynamic(
             model,
             {torch.nn.Linear},
-            dtype=torch.qint8
+            dtype=torch.qint8,
+            inplace=True
         )
 
         # Load our saved INT8 weights (downloaded from the GitHub Release
