@@ -673,6 +673,10 @@ def analyze_sector_performance(stock, ticker):
         # FMP Stable API endpoint
         url = "https://financialmodelingprep.com/stable/sector-performance-snapshot"
 
+        print("=== FMP SECTOR REQUEST START ===", flush=True)
+        print(f"FMP URL: {url}", flush=True)
+        print(f"FMP API key exists: {bool(api_key)}", flush=True)
+
         today = datetime.now()
 
         sector_data = None
@@ -691,11 +695,20 @@ def analyze_sector_performance(stock, ticker):
             }
 
             try:
+                print(f"Trying FMP date: {candidate_date}", flush=True)
+
                 response = requests.get(
                     url,
                     params=params,
                     timeout=5
                 )
+
+                print(
+                    f"FMP response: status={response.status_code}, "
+                    f"length={len(response.text)}",
+                    flush=True
+                )
+                print(f"FMP response body: {response.text[:500]}", flush=True)
 
                 response.raise_for_status()
 
@@ -725,6 +738,9 @@ def analyze_sector_performance(stock, ticker):
                 )
                 continue
 
+        print(f"Final sector_data type: {type(sector_data)}", flush=True)
+        print(f"Final sector_data: {sector_data}", flush=True)        
+        
         if sector_data is None:
             return {
                 "success": False,
