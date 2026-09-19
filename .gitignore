@@ -5,3 +5,4 @@ __pycache__/
 keys.txt
 venv/
 models/
+models/*.pt

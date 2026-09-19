@@ -217,6 +217,15 @@ def prewarm_forecast_engine():
     threading.Thread(target=_warm, daemon=True).start()
 
 
+@app.on_event("startup")
+def prewarm_finbert():
+    """Kicks off the INT8 FinBERT load in a background thread as soon as
+    the app starts. news.start_model_loading() is safe to call exactly
+    once here — it spins up load_finbert_model() on its own daemon
+    thread and is a no-op if called again while already loading/loaded."""
+    news.start_model_loading()
+
+
 @app.get("/health")
 def health():
     """Dedicated health-check route for uptime monitoring services."""

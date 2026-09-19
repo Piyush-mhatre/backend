@@ -5,7 +5,7 @@ import threading
 import requests
 import torch
 from fastapi import APIRouter, HTTPException
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 
 router = APIRouter(
     prefix="/news",
@@ -41,6 +41,11 @@ PREFERRED_DOMAINS = []  # e.g. ["reuters.com", "moneycontrol.com", "livemint.com
 
 # ============================================================
 # Global model state
+#
+# NOTE: the actual model is built lazily inside load_finbert_model()
+# (triggered by start_model_loading(), called at app startup elsewhere).
+# Nothing heavy happens here at import time — tokenizer/model/state are
+# just declared as None/False until the background thread populates them.
 # ============================================================
 
 tokenizer = None
@@ -81,23 +86,30 @@ def load_finbert_model():
     print("Loading INT8 FinBERT model...")
 
     try:
-        # Load tokenizer from Hugging Face
+        # Tokenizer is just vocab + config, a few hundred KB — fine to
+        # pull from Hugging Face on every cold start.
         print("Loading FinBERT tokenizer...")
 
         tokenizer = AutoTokenizer.from_pretrained(
             MODEL_NAME
         )
 
-        # Create original FinBERT architecture
-        print("Creating FinBERT architecture...")
+        # Build the FinBERT architecture from config only — this does
+        # NOT download the ~440MB pretrained weights. The model comes
+        # out with random weights, which is fine because we immediately
+        # overwrite every one of them with our own quantized state_dict
+        # below.
+        print("Creating FinBERT architecture (config only, no weight download)...")
 
-        model = AutoModelForSequenceClassification.from_pretrained(
-            MODEL_NAME
-        )
+        config = AutoConfig.from_pretrained(MODEL_NAME)
+        model = AutoModelForSequenceClassification.from_config(config)
 
         model.eval()
 
-        # Apply dynamic INT8 quantization
+        # Apply dynamic INT8 quantization — this must happen BEFORE
+        # load_state_dict, since quantization changes module structure
+        # (Linear -> DynamicQuantizedLinear) and our saved state_dict's
+        # keys/shapes match the quantized structure, not the plain one.
         print("Applying INT8 quantization...")
 
         model = torch.quantization.quantize_dynamic(
@@ -106,7 +118,9 @@ def load_finbert_model():
             dtype=torch.qint8
         )
 
-        # Load our saved INT8 weights
+        # Load our saved INT8 weights (downloaded from the GitHub Release
+        # asset into MODEL_PATH by Render's build command — see backend
+        # README / render build command).
         print("Loading local INT8 weights...")
 
         state_dict = torch.load(

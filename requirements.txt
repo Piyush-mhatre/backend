@@ -14,3 +14,16 @@ requests==2.32.3
 # costs disk/build time, not runtime RAM, while FORECAST_ENGINE=trend
 # (the default) is active.
 prophet==1.4.0
+
+# --- news sentiment feature ---
+# CPU-only wheel — Render's free tier has no GPU, and the GPU build of
+# torch is dramatically larger for zero benefit here.
+#
+# Pinned to match the exact local environment that created and quantized
+# finbert_int8.pt (torch 2.6.0 / transformers 4.49.0) — a hand-saved
+# quantized state_dict is sensitive to internal module naming, which can
+# shift between versions, so matching your local setup exactly matters
+# more here than using the newest release.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0
+transformers==4.49.0
