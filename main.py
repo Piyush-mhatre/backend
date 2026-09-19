@@ -16,11 +16,16 @@ import threading
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from routers import stock_analysis
+from routers import news
 
 app = FastAPI(title="Piyush Mhatre — Portfolio Backend", version="0.2.0")
 app.include_router(stock_analysis.router)
+app.include_router(news.router)
 
 # =====================================================================
 # CORS — only these origins are allowed to call this API from a browser.
