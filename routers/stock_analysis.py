@@ -89,6 +89,60 @@ def _ensure_heavy_libs():
 # site. 5 years keeps the chart meaningful while cutting that dramatically.
 HISTORY_PERIOD = "5y"
 
+# =====================================================================
+# Retry + short-lived cache for stock.history()
+#
+# Yahoo Finance (which yfinance scrapes — there's no official API key
+# involved) intermittently rate-limits or crumb-rejects requests, and
+# this seems to hit different Yahoo endpoints inconsistently: financials/
+# balance sheet can succeed while price history comes back empty or
+# truncated to a single row in the same request. Cloud/datacenter IPs
+# (Render included) get this more often than residential ones. Retrying
+# a couple of times with a short backoff clears most of these, since
+# they're typically transient — and caching a good result for a few
+# minutes means repeated test calls on the same ticker (e.g. while
+# debugging) don't keep re-triggering the same limit.
+# =====================================================================
+import time
+
+_history_cache = {}  # ticker -> (fetched_at_unix_ts, DataFrame)
+HISTORY_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
+def _fetch_history_with_retry(stock, ticker, period, max_attempts=3, backoff_seconds=2):
+    cached = _history_cache.get(ticker)
+    if cached is not None:
+        fetched_at, cached_df = cached
+        if time.time() - fetched_at < HISTORY_CACHE_TTL_SECONDS:
+            return cached_df.copy()
+
+    last_df = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            df = stock.history(period=period)
+        except Exception as e:
+            print(f"stock.history() attempt {attempt} for {ticker} raised: {e}")
+            df = None
+
+        if df is not None and not df.empty:
+            usable_rows = len(df.dropna(subset=["Open", "High", "Low", "Close"]))
+            if usable_rows > 1:
+                _history_cache[ticker] = (time.time(), df)
+                return df
+            print(
+                f"stock.history() attempt {attempt} for {ticker} returned only "
+                f"{usable_rows} usable row(s) — likely Yahoo rate-limiting, retrying"
+            )
+        last_df = df
+
+        if attempt < max_attempts:
+            time.sleep(backoff_seconds * attempt)
+
+    # Every attempt came back thin/empty — return whatever we last got so the
+    # caller's existing empty/dropna checks handle it the same way they
+    # already do, rather than raising a new error type here.
+    return last_df if last_df is not None else pd.DataFrame()
+
 def get_fmp_company_profile(ticker):
     """Fetch company profile information from Financial Modeling Prep."""
     api_key = os.environ.get("FMP_API_KEY")
@@ -503,7 +557,17 @@ def forecast_stock(stock, history_df, ticker):
 # =====================================================================
 def analyze_candlestick_and_info(stock, history_df, ticker):
     try:
-        stock_info = stock.info
+        # stock.info triggers Yahoo's crumb/rate-limit check (same one that
+        # was hitting sector performance) — guard it so a Yahoo-side
+        # failure only degrades the company-info fields, instead of taking
+        # down the candlestick chart too, which needs nothing from here
+        # except history_df (already fetched separately and safely above).
+        try:
+            stock_info = stock.info
+        except Exception as e:
+            print(f"yfinance .info failed in candlestick/info (likely Yahoo crumb/rate-limit): {e}")
+            stock_info = {}
+
         fmp_profile = get_fmp_company_profile(ticker) or {}
 
         company_name = fmp_profile.get("companyName") or stock_info.get("shortName", ticker)
@@ -912,7 +976,7 @@ def analyze(payload: StockAnalyzeRequest):
         # the same data). This is the main real RAM/latency win available
         # here beyond the forecast-engine toggle.
         stock = yf.Ticker(ticker)
-        history_df = stock.history(period=HISTORY_PERIOD)
+        history_df = _fetch_history_with_retry(stock, ticker, HISTORY_PERIOD)
 
         if history_df.empty:
             raise HTTPException(status_code=404, detail=f"No data found for ticker '{ticker}'")
