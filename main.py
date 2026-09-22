@@ -22,10 +22,12 @@ load_dotenv()
 
 from routers import stock_analysis
 from routers import news
+from routers import gold
 
 app = FastAPI(title="Piyush Mhatre — Portfolio Backend", version="0.2.0")
 app.include_router(stock_analysis.router)
 app.include_router(news.router)
+app.include_router(gold.router)
 
 # =====================================================================
 # CORS — only these origins are allowed to call this API from a browser.
