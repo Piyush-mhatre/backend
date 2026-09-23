@@ -262,6 +262,7 @@ def get_gold_data(force_refresh=False):
         "rate_is_estimated": rate_is_estimated,
         "current_price": {
             "per_ounce_usd": round(current_price_per_ounce, 2),
+            "per_ounce_inr": round(current_price_per_ounce * usd_inr_rate, 2),
             "per_gram_usd": round(current_price_per_gram, 2),
             "per_gram_inr": round(current_price_per_gram * usd_inr_rate, 2),
         },
@@ -334,16 +335,16 @@ def trigger_insights_update(gold_data):
                 raise RuntimeError("GEMINI_API_KEY environment variable is not configured.")
 
             # Gemini occasionally returns a 503 "high demand, try again
-            # later" — that's an explicit signal it's transient. Retry
-            # the primary model a couple of times, then fall back to the
-            # separate lite-tier model (different capacity pool, so a
-            # 503 on the primary doesn't necessarily mean the fallback
-            # is also congested) rather than hammering the same
-            # overloaded endpoint four times in a row.
+            # later" — that's an explicit signal it's transient. Falls
+            # back to the separate lite-tier model after just ONE
+            # primary failure (different capacity pool, so a 503 on the
+            # primary doesn't mean the fallback is congested too) rather
+            # than exhausting retries on the same overloaded model
+            # first — that was the main cause of slow resolution.
             models_to_try = [
                 GEMINI_MODEL_PRIMARY,
-                GEMINI_MODEL_PRIMARY,
                 GEMINI_MODEL_FALLBACK,
+                GEMINI_MODEL_PRIMARY,
                 GEMINI_MODEL_FALLBACK,
             ]
             insights_text = None
@@ -363,7 +364,14 @@ def trigger_insights_update(gold_data):
                     )
                     print(f"Gemini insights attempt {attempt} ({model_name}) failed: {last_error}")
                     if attempt < len(models_to_try) and is_transient:
-                        time.sleep(3 * attempt)
+                        next_model = models_to_try[attempt]  # attempt is 1-indexed, so this is the next one up
+                        if next_model == model_name:
+                            # Retrying the SAME model — worth a short
+                            # backoff so we're not hammering it.
+                            time.sleep(3 * attempt)
+                        # else: switching to a different model entirely —
+                        # no reason to wait, it has its own separate
+                        # capacity, try it immediately.
                         continue
                     raise
 
