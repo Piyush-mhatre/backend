@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 
 import requests
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 router = APIRouter(prefix="/gold", tags=["Gold"])
 
@@ -185,10 +185,14 @@ def _fetch_gold_history():
 
 
 def get_gold_data(force_refresh=False):
-    """Returns (data_dict, success_bool)."""
+    """Returns (data_dict, success_bool, is_fresh_bool). is_fresh tells
+    the caller whether this actually hit Yahoo Finance just now, or
+    served the cached result — used so /price doesn't re-trigger a
+    Gemini call on every single hit within the cache window (see the
+    /price route below)."""
     now = time.time()
     if not force_refresh and _gold_cache["data"] and (now - _gold_cache["fetched_at"] < GOLD_CACHE_TTL_SECONDS):
-        return _gold_cache["data"], True
+        return _gold_cache["data"], True, False
 
     data = _fetch_gold_history()
 
@@ -196,8 +200,8 @@ def get_gold_data(force_refresh=False):
     # (data.iloc[-7]) is safe.
     if data is None or len(data) < 8:
         if _gold_cache["data"]:
-            return _gold_cache["data"], True
-        return {"success": False, "error": "Gold price data unavailable from any source right now."}, False
+            return _gold_cache["data"], True, False
+        return {"success": False, "error": "Gold price data unavailable from any source right now."}, False, False
 
     current_price_per_ounce = float(data.iloc[-1]["Close"])
 
@@ -206,8 +210,8 @@ def get_gold_data(force_refresh=False):
     # a stray 0 or a misparsed value).
     if not (100 < current_price_per_ounce < 10000):
         if _gold_cache["data"]:
-            return _gold_cache["data"], True
-        return {"success": False, "error": "Retrieved gold price is outside a plausible range."}, False
+            return _gold_cache["data"], True, False
+        return {"success": False, "error": "Retrieved gold price is outside a plausible range."}, False, False
 
     usd_inr_rate, rate_is_estimated = get_usd_inr_rate()
 
@@ -240,7 +244,7 @@ def get_gold_data(force_refresh=False):
 
     _gold_cache["data"] = response_data
     _gold_cache["fetched_at"] = now
-    return response_data, True
+    return response_data, True, True
 
 
 # =====================================================================
@@ -336,13 +340,21 @@ def trigger_insights_update(gold_data):
 @router.get("/price")
 def gold_price(refresh: bool = Query(False, description="Force a fresh fetch, bypassing the 1-hour cache")):
     """Current gold price (per ounce/gram, USD+INR), karat breakdown,
-    30-day plot data, and a simple trend recommendation. Triggers a
-    background Gemini insights refresh on success — poll /gold/insights
-    separately to pick that up once it's ready."""
-    data, success = get_gold_data(force_refresh=refresh)
+    30-day plot data, and a simple trend recommendation.
+
+    Auto-triggers a background Gemini insights refresh only when this
+    call actually hit Yahoo Finance (a fresh fetch, or the very first
+    call ever) — NOT on every hit that's served from the 1-hour price
+    cache. Otherwise every repeat page load within that hour would
+    silently re-trigger a new Gemini call for no reason. Poll
+    /gold/insights separately to pick up the result once it's ready;
+    use /gold/insights/refresh to manually regenerate insights without
+    touching Yahoo Finance at all (e.g. to retry after a Gemini 503)."""
+    data, success, is_fresh = get_gold_data(force_refresh=refresh)
 
     if success and data.get("success"):
-        trigger_insights_update(data)
+        if is_fresh or _insights_cache["result"] is None:
+            trigger_insights_update(data)
 
     return data
 
@@ -351,7 +363,7 @@ def gold_price(refresh: bool = Query(False, description="Force a fresh fetch, by
 def gold_insights():
     """Latest AI-generated commentary on the gold price trend. Returns
     a 'processing' status until the background thread kicked off by
-    /gold/price finishes — poll this after calling /gold/price."""
+    /gold/price (or /gold/insights/refresh) finishes."""
     result = _insights_cache["result"]
     if not result:
         return {
@@ -360,3 +372,19 @@ def gold_insights():
             "status": "processing" if _insights_loading else "not_started",
         }
     return result
+
+
+@router.post("/insights/refresh")
+def gold_insights_refresh():
+    """Manually regenerate AI insights using whatever gold price data is
+    currently cached — does NOT call Yahoo Finance at all, so this is
+    safe to retry as many times as needed (e.g. after a Gemini 503)
+    without adding any load to the yfinance/Yahoo side, which already
+    has its own rate-limiting problems independent of this feature."""
+    if not _gold_cache["data"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No gold price data cached yet — call /gold/price first."
+        )
+    trigger_insights_update(_gold_cache["data"])
+    return {"success": True, "status": "processing"}
