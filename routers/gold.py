@@ -118,12 +118,18 @@ CURRENCY_CACHE_TTL_SECONDS = 60 * 60  # 1 hour
 USD_INR_EMERGENCY_FALLBACK = 88.0
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL_PRIMARY = "gemini-flash-latest"
-# Separate, lighter-weight alias — likely draws from different capacity
-# than the primary Flash model, so worth trying when the primary keeps
-# returning 503 "high demand" rather than retrying the exact same
-# congested endpoint over and over.
-GEMINI_MODEL_FALLBACK = "gemini-flash-lite-latest"
+# Swapped from an earlier version of this file: the account's own rate-
+# limit dashboard shows "gemini-flash-latest" currently resolves to
+# Gemini 3.8 Flash, capped at just 20 requests/day on the free tier —
+# easy to exhaust from normal use plus retries alone (which is exactly
+# what caused a 429 RESOURCE_EXHAUSTED, separate from the "high demand"
+# 503s this retry logic was originally built for). "gemini-flash-lite-
+# latest" resolves to Gemini 3.5 Flash Lite, with 500 requests/day and
+# a higher per-minute limit — a much better fit as the default for a
+# feature that gets hit by ordinary portfolio traffic. The tight-quota
+# Flash model is kept only as a rare last-resort fallback below.
+GEMINI_MODEL_PRIMARY = "gemini-flash-lite-latest"
+GEMINI_MODEL_FALLBACK = "gemini-flash-latest"
 
 # =====================================================================
 # In-memory caches (see module docstring for why not on-disk)
@@ -335,17 +341,16 @@ def trigger_insights_update(gold_data):
                 raise RuntimeError("GEMINI_API_KEY environment variable is not configured.")
 
             # Gemini occasionally returns a 503 "high demand, try again
-            # later" — that's an explicit signal it's transient. Falls
-            # back to the separate lite-tier model after just ONE
-            # primary failure (different capacity pool, so a 503 on the
-            # primary doesn't mean the fallback is congested too) rather
-            # than exhausting retries on the same overloaded model
-            # first — that was the main cause of slow resolution.
+            # later" — that's an explicit signal it's transient. The
+            # primary (Lite) model has a generous daily quota, so it's
+            # worth a couple of tries; the fallback (Flash) model's
+            # quota is tight (20/day on the free tier), so it's used at
+            # most ONCE, as a last resort, to avoid burning through that
+            # scarce budget on retries.
             models_to_try = [
                 GEMINI_MODEL_PRIMARY,
                 GEMINI_MODEL_FALLBACK,
                 GEMINI_MODEL_PRIMARY,
-                GEMINI_MODEL_FALLBACK,
             ]
             insights_text = None
             last_error = None
