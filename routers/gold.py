@@ -43,12 +43,45 @@ import os
 import threading
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 
 import requests
 from fastapi import APIRouter, HTTPException, Query
 
 router = APIRouter(prefix="/gold", tags=["Gold"])
+
+# =====================================================================
+# Hard timeout wrapper for the Gemini call
+#
+# google-genai's own HttpOptions(timeout=...) has open GitHub issues
+# reporting it doesn't reliably work (doesn't actually extend/enforce
+# the timeout in some SDK versions). Rather than trust that, every
+# Gemini call runs inside this executor and gets a real wall-clock
+# deadline enforced by Python itself: if the call hasn't returned within
+# GEMINI_CALL_TIMEOUT_SECONDS, we give up on waiting for it regardless
+# of what the SDK is doing internally. This matters a lot here — without
+# it, a single hung call leaves _insights_loading stuck True forever
+# (the code that resets it, in trigger_insights_update's finally block,
+# never runs if the call it's waiting on never returns), silently
+# breaking every future insights request — including the manual
+# "Refresh AI analysis" button — until the whole server restarts.
+# =====================================================================
+_gemini_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gemini-call")
+GEMINI_CALL_TIMEOUT_SECONDS = 25
+
+
+def _call_with_hard_timeout(fn, timeout_seconds):
+    future = _gemini_executor.submit(fn)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FutureTimeoutError:
+        # The underlying call may still be running in the background —
+        # Python can't forcibly kill a thread — but WE move on regardless,
+        # which is what actually matters: it guarantees this function
+        # returns within a bounded time no matter what the SDK does.
+        raise TimeoutError(f"Gemini call did not respond within {timeout_seconds}s")
+
 
 # =====================================================================
 # Lazy-loaded heavy dependency: yfinance
@@ -317,11 +350,17 @@ def trigger_insights_update(gold_data):
             last_error = None
             for attempt, model_name in enumerate(models_to_try, start=1):
                 try:
-                    insights_text = _generate_gemini_insights(gold_data, model_name)
+                    insights_text = _call_with_hard_timeout(
+                        lambda m=model_name: _generate_gemini_insights(gold_data, m),
+                        GEMINI_CALL_TIMEOUT_SECONDS,
+                    )
                     break
                 except Exception as e:
                     last_error = str(e)
-                    is_transient = any(marker in last_error for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+                    is_transient = any(
+                        marker in last_error
+                        for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "did not respond within")
+                    )
                     print(f"Gemini insights attempt {attempt} ({model_name}) failed: {last_error}")
                     if attempt < len(models_to_try) and is_transient:
                         time.sleep(3 * attempt)
@@ -334,6 +373,7 @@ def trigger_insights_update(gold_data):
                 "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "gold_price_at_analysis": gold_data.get("current_price", {}).get("per_ounce_usd"),
             }
+            print(f"Gemini insights generated successfully (attempt {attempt}, model {model_name})")
         except Exception as e:
             print(f"Error updating Gemini insights: {e}")
             _insights_cache["result"] = {
