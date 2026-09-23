@@ -85,7 +85,12 @@ CURRENCY_CACHE_TTL_SECONDS = 60 * 60  # 1 hour
 USD_INR_EMERGENCY_FALLBACK = 88.0
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_MODEL_PRIMARY = "gemini-flash-latest"
+# Separate, lighter-weight alias — likely draws from different capacity
+# than the primary Flash model, so worth trying when the primary keeps
+# returning 503 "high demand" rather than retrying the exact same
+# congested endpoint over and over.
+GEMINI_MODEL_FALLBACK = "gemini-flash-lite-latest"
 
 # =====================================================================
 # In-memory caches (see module docstring for why not on-disk)
@@ -250,7 +255,7 @@ def get_gold_data(force_refresh=False):
 # =====================================================================
 # Gemini AI insights
 # =====================================================================
-def _generate_gemini_insights(gold_data):
+def _generate_gemini_insights(gold_data, model):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY environment variable is not configured.")
 
@@ -274,7 +279,7 @@ Please provide:
 
 Keep it concise (150-200 words) and avoid tables."""
 
-    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    response = client.models.generate_content(model=model, contents=prompt)
     return response.text.strip() if response and response.text else "No insights available."
 
 
@@ -296,22 +301,30 @@ def trigger_insights_update(gold_data):
                 raise RuntimeError("GEMINI_API_KEY environment variable is not configured.")
 
             # Gemini occasionally returns a 503 "high demand, try again
-            # later" — that's an explicit signal it's transient, worth
-            # a couple of retries before treating it as a real failure
-            # (same reasoning as the yfinance retries above).
+            # later" — that's an explicit signal it's transient. Retry
+            # the primary model a couple of times, then fall back to the
+            # separate lite-tier model (different capacity pool, so a
+            # 503 on the primary doesn't necessarily mean the fallback
+            # is also congested) rather than hammering the same
+            # overloaded endpoint four times in a row.
+            models_to_try = [
+                GEMINI_MODEL_PRIMARY,
+                GEMINI_MODEL_PRIMARY,
+                GEMINI_MODEL_FALLBACK,
+                GEMINI_MODEL_FALLBACK,
+            ]
             insights_text = None
             last_error = None
-            attempts = 3
-            for attempt in range(1, attempts + 1):
+            for attempt, model_name in enumerate(models_to_try, start=1):
                 try:
-                    insights_text = _generate_gemini_insights(gold_data)
+                    insights_text = _generate_gemini_insights(gold_data, model_name)
                     break
                 except Exception as e:
                     last_error = str(e)
                     is_transient = any(marker in last_error for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
-                    print(f"Gemini insights attempt {attempt} failed: {last_error}")
-                    if attempt < attempts and is_transient:
-                        time.sleep(4 * attempt)
+                    print(f"Gemini insights attempt {attempt} ({model_name}) failed: {last_error}")
+                    if attempt < len(models_to_try) and is_transient:
+                        time.sleep(3 * attempt)
                         continue
                     raise
 
