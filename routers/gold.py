@@ -39,11 +39,12 @@ Changes from the original, and why:
     is actually hit, not at app boot.
 """
 
+import asyncio
 import os
+import re
 import threading
 import time
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 
 import requests
@@ -52,35 +53,163 @@ from fastapi import APIRouter, HTTPException, Query
 router = APIRouter(prefix="/gold", tags=["Gold"])
 
 # =====================================================================
-# Hard timeout wrapper for the Gemini call
+# Multi-model Gemini racing
 #
-# google-genai's own HttpOptions(timeout=...) has open GitHub issues
-# reporting it doesn't reliably work (doesn't actually extend/enforce
-# the timeout in some SDK versions). Rather than trust that, every
-# Gemini call runs inside this executor and gets a real wall-clock
-# deadline enforced by Python itself: if the call hasn't returned within
-# GEMINI_CALL_TIMEOUT_SECONDS, we give up on waiting for it regardless
-# of what the SDK is doing internally. This matters a lot here — without
-# it, a single hung call leaves _insights_loading stuck True forever
-# (the code that resets it, in trigger_insights_update's finally block,
-# never runs if the call it's waiting on never returns), silently
-# breaking every future insights request — including the manual
-# "Refresh AI analysis" button — until the whole server restarts.
+# Earlier version of this file used a ThreadPoolExecutor + future with
+# a timeout to bound how long a Gemini call could take. That had a real
+# bug: Python threads can't be forcibly killed, so a genuinely hung
+# call just kept running forever in the background, permanently
+# occupying one of the pool's worker slots. Once both slots were
+# occupied by hung calls, every future call — including automatic
+# retries and the manual "Refresh AI analysis" button — queued up
+# behind them and could never run at all, each one adding another
+# permanently-stuck, never-cleaned-up entry to the executor's internal
+# queue. Repeated page loads/refreshes kept adding more of these, which
+# is what was slowly filling up Render's memory until the whole app
+# crashed.
+#
+# The real fix is to use asyncio instead of threads: an asyncio.Task
+# CAN be genuinely cancelled mid-flight (the underlying async HTTP call
+# actually stops), so a timed-out or "lost the race" attempt is
+# properly cleaned up rather than left running forever. Multiple models
+# are raced concurrently in small batches; the first to succeed wins,
+# and the rest of that batch is cancelled immediately.
+#
+# This also directly implements the "try a few models at once, move on
+# quickly if none respond" approach: each model has its own separate
+# daily quota on the free tier, so trying several different ones is a
+# real way to multiply total available capacity, not just a reliability
+# nicety — useful now for gold insights and reusable as-is for a future
+# Gemini-powered chatbot feature.
 # =====================================================================
-_gemini_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gemini-call")
-GEMINI_CALL_TIMEOUT_SECONDS = 25
+
+# Ordered by preference, based on (a) this project's own rate-limit
+# dashboard (Google AI Studio -> usage) and (b) Google's official models
+# page, which explicitly says: "we are limiting access to the 2.5
+# models to users who have actively used them in the past... For any
+# new projects, use our latest models: 3.5 Flash-Lite or 3.8 Flash."
+# In practice, gemini-2.5-flash and gemini-2.5-flash-lite now return a
+# hard 404 "no longer available to new users" for this account — so
+# they're excluded entirely rather than kept as a deprioritized last
+# resort (see the removed-models note further down this list).
+# Quotas differ a lot between models and change over time — re-check
+# https://aistudio.google.com/usage occasionally and adjust this list;
+# nothing here is guaranteed to stay accurate indefinitely.
+GEMINI_CANDIDATE_MODELS = [
+    "gemini-3.5-flash-lite",   # 500 req/day on this account — Stable, Google's recommended lite default
+    "gemini-3.1-flash-lite",   # 500 req/day — Stable
+    "gemini-3.5-flash",        # 20 req/day — Stable
+    "gemini-3.6-flash",        # 20 req/day — Stable
+    "gemini-3.7-flash",        # 20 req/day — Stable
+    "gemini-3.8-flash",        # 20 req/day — Stable, Google's recommended flagship default
+    "gemini-3-flash-preview",  # confirmed callable via list_gemini_models.py — a Preview
+                                # model, so Google could change/retire it with less notice
+                                # than the dated stable releases above, but it's a genuinely
+                                # separate quota pool while it's around
+    # gemini-2.5-flash-lite / gemini-2.5-flash used to be listed here as
+    # a last resort (Google's docs said they were deprioritized, not
+    # removed) — but they now return a hard 404 "no longer available to
+    # new users" for this account specifically, so they're just dead
+    # weight in the race at this point. Removed rather than kept as a
+    # guaranteed-failing entry.
+]
+
+GEMINI_RACE_BATCH_SIZE = 3          # try this many models concurrently per round
+GEMINI_RACE_ATTEMPT_TIMEOUT = 15    # seconds to wait for a batch before moving on — a real
+                                     # successful call has taken longer than 10s in practice,
+                                     # so 10 was cutting off genuinely-in-progress responses
+
+# Per-model cooldowns — once a model reports quota exhaustion
+# (429 RESOURCE_EXHAUSTED), there's no point trying it again until its
+# quota resets, so it's skipped for a while rather than wasting a race
+# slot on a guaranteed failure. A 404 (model doesn't exist / has been
+# deprecated) gets a long cooldown too — that's not transient like a
+# quota limit, so retrying it every single race would waste a slot on a
+# guaranteed failure indefinitely, until someone notices and edits the
+# candidate list.
+_model_cooldown_until = {}  # model name -> unix timestamp
+DEFAULT_COOLDOWN_SECONDS = 4 * 60 * 60   # fallback if a 429 doesn't include a retry delay
+NOT_FOUND_COOLDOWN_SECONDS = 24 * 60 * 60  # 404s are effectively permanent, not transient
 
 
-def _call_with_hard_timeout(fn, timeout_seconds):
-    future = _gemini_executor.submit(fn)
-    try:
-        return future.result(timeout=timeout_seconds)
-    except FutureTimeoutError:
-        # The underlying call may still be running in the background —
-        # Python can't forcibly kill a thread — but WE move on regardless,
-        # which is what actually matters: it guarantees this function
-        # returns within a bounded time no matter what the SDK does.
-        raise TimeoutError(f"Gemini call did not respond within {timeout_seconds}s")
+def _mark_cooldown_if_permanent_error(model_name, error_text):
+    if any(marker in error_text for marker in ("RESOURCE_EXHAUSTED", "429")):
+        match = re.search(r"retry in ([\d.]+)s", error_text)
+        cooldown_seconds = float(match.group(1)) if match else DEFAULT_COOLDOWN_SECONDS
+        _model_cooldown_until[model_name] = time.time() + cooldown_seconds
+    elif any(marker in error_text for marker in ("404", "NOT_FOUND")):
+        _model_cooldown_until[model_name] = time.time() + NOT_FOUND_COOLDOWN_SECONDS
+
+
+def _available_models(candidates):
+    now = time.time()
+    return [m for m in candidates if _model_cooldown_until.get(m, 0) <= now]
+
+
+
+async def _call_gemini_once(aio_client, model, prompt):
+    response = await aio_client.models.generate_content(model=model, contents=prompt)
+    return response.text.strip() if response and response.text else "No insights available."
+
+
+async def _race_gemini_models(prompt, models):
+    """Tries `models` in batches of GEMINI_RACE_BATCH_SIZE, concurrently
+    within each batch. Returns (text, model_name) from whichever model
+    responds first with a success. Raises if every model in every batch
+    fails or times out."""
+    from google import genai  # lazy import — see module docstring
+
+    last_errors = []
+
+    # `async with ... .aio as client` ensures the underlying async HTTP
+    # client is properly closed before this function returns — without
+    # it, cleanup can end up happening later via Python's garbage
+    # collector, AFTER asyncio.run() has already torn down the event
+    # loop the cleanup needs, producing a real "Event loop is closed"
+    # error and leaking the underlying HTTP connection each time this
+    # runs (see: googleapis/python-genai issues on exactly this).
+    async with genai.Client(api_key=GEMINI_API_KEY).aio as client:
+        for i in range(0, len(models), GEMINI_RACE_BATCH_SIZE):
+            batch = models[i:i + GEMINI_RACE_BATCH_SIZE]
+            tasks = {asyncio.create_task(_call_gemini_once(client, m, prompt)): m for m in batch}
+
+            done, pending = await asyncio.wait(
+                tasks.keys(),
+                timeout=GEMINI_RACE_ATTEMPT_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Whether we found a winner or just timed out, any still-
+            # running attempts in this batch are cancelled here — this
+            # is the actual fix for the earlier leak: cancel() on an
+            # asyncio.Task genuinely interrupts the in-flight call,
+            # instead of leaving it running forever the way an
+            # abandoned thread would.
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            for t in done:
+                model_name = tasks[t]
+                exc = t.exception()
+                if exc is None:
+                    return t.result(), model_name
+                error_text = str(exc)
+                print(f"Gemini race: {model_name} failed: {error_text}")
+                _mark_cooldown_if_permanent_error(model_name, error_text)
+                last_errors.append(f"{model_name}: {error_text}")
+
+            for model_name in [tasks[t] for t in pending]:
+                last_errors.append(f"{model_name}: timed out after {GEMINI_RACE_ATTEMPT_TIMEOUT}s")
+                print(f"Gemini race: {model_name} timed out after {GEMINI_RACE_ATTEMPT_TIMEOUT}s")
+
+        # Show every failure, not just the last few — with 3 models per
+        # batch across all batches, truncating this list would silently
+        # hide what happened with earlier batches (including whichever
+        # generous-quota Lite models were tried first), which is exactly
+        # the wrong thing to hide when debugging why every model failed.
+        raise RuntimeError("All Gemini models failed or timed out: " + "; ".join(last_errors))
 
 
 # =====================================================================
@@ -97,6 +226,7 @@ def _ensure_yfinance():
     import yfinance as _yf
     yf = _yf
     _yf_loaded = True
+
 
 
 # =====================================================================
@@ -118,18 +248,9 @@ CURRENCY_CACHE_TTL_SECONDS = 60 * 60  # 1 hour
 USD_INR_EMERGENCY_FALLBACK = 88.0
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# Swapped from an earlier version of this file: the account's own rate-
-# limit dashboard shows "gemini-flash-latest" currently resolves to
-# Gemini 3.8 Flash, capped at just 20 requests/day on the free tier —
-# easy to exhaust from normal use plus retries alone (which is exactly
-# what caused a 429 RESOURCE_EXHAUSTED, separate from the "high demand"
-# 503s this retry logic was originally built for). "gemini-flash-lite-
-# latest" resolves to Gemini 3.5 Flash Lite, with 500 requests/day and
-# a higher per-minute limit — a much better fit as the default for a
-# feature that gets hit by ordinary portfolio traffic. The tight-quota
-# Flash model is kept only as a rare last-resort fallback below.
-GEMINI_MODEL_PRIMARY = "gemini-flash-lite-latest"
-GEMINI_MODEL_FALLBACK = "gemini-flash-latest"
+# Model selection now lives in GEMINI_CANDIDATE_MODELS near the top of
+# this file, used by the racing logic in _race_gemini_models.
+
 
 # =====================================================================
 # In-memory caches (see module docstring for why not on-disk)
@@ -295,18 +416,11 @@ def get_gold_data(force_refresh=False):
 # =====================================================================
 # Gemini AI insights
 # =====================================================================
-def _generate_gemini_insights(gold_data, model):
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY environment variable is not configured.")
-
-    from google import genai  # lazy import — see module docstring
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
+def _build_gold_prompt(gold_data):
     dates = gold_data.get("plot_data", {}).get("dates", [])
     date_range = f"{dates[0]} to {dates[-1]}" if dates else "the last 30 days"
 
-    prompt = f"""You are a financial expert. Analyze the following gold price data:
+    return f"""You are a financial expert. Analyze the following gold price data:
 
 Current Price: ${gold_data.get('current_price', {}).get('per_ounce_usd')} per ounce (${gold_data.get('current_price', {}).get('per_gram_usd')} per gram)
 Recent Trend: {"Up" if gold_data.get("recommendation") == "Positive" else "Down"}
@@ -319,15 +433,16 @@ Please provide:
 
 Keep it concise (150-200 words) and avoid tables."""
 
-    response = client.models.generate_content(model=model, contents=prompt)
-    return response.text.strip() if response and response.text else "No insights available."
-
 
 def trigger_insights_update(gold_data):
     """Fire-and-forget background refresh — mirrors the FinBERT loading
     pattern in news.py (daemon thread + a loading flag), so a slow or
     failed Gemini call never blocks the /gold/price response that
-    triggered it."""
+    triggered it. The daemon thread runs its own asyncio event loop
+    (asyncio.run) purely so it can use the racing/cancellation logic in
+    _race_gemini_models — this thread is still the same fire-and-forget
+    mechanism as before, just with a proper async engine underneath it
+    instead of the old thread-pool approach."""
     global _insights_loading
 
     if _insights_loading:
@@ -340,45 +455,12 @@ def trigger_insights_update(gold_data):
             if not GEMINI_API_KEY:
                 raise RuntimeError("GEMINI_API_KEY environment variable is not configured.")
 
-            # Gemini occasionally returns a 503 "high demand, try again
-            # later" — that's an explicit signal it's transient. The
-            # primary (Lite) model has a generous daily quota, so it's
-            # worth a couple of tries; the fallback (Flash) model's
-            # quota is tight (20/day on the free tier), so it's used at
-            # most ONCE, as a last resort, to avoid burning through that
-            # scarce budget on retries.
-            models_to_try = [
-                GEMINI_MODEL_PRIMARY,
-                GEMINI_MODEL_FALLBACK,
-                GEMINI_MODEL_PRIMARY,
-            ]
-            insights_text = None
-            last_error = None
-            for attempt, model_name in enumerate(models_to_try, start=1):
-                try:
-                    insights_text = _call_with_hard_timeout(
-                        lambda m=model_name: _generate_gemini_insights(gold_data, m),
-                        GEMINI_CALL_TIMEOUT_SECONDS,
-                    )
-                    break
-                except Exception as e:
-                    last_error = str(e)
-                    is_transient = any(
-                        marker in last_error
-                        for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "did not respond within")
-                    )
-                    print(f"Gemini insights attempt {attempt} ({model_name}) failed: {last_error}")
-                    if attempt < len(models_to_try) and is_transient:
-                        next_model = models_to_try[attempt]  # attempt is 1-indexed, so this is the next one up
-                        if next_model == model_name:
-                            # Retrying the SAME model — worth a short
-                            # backoff so we're not hammering it.
-                            time.sleep(3 * attempt)
-                        # else: switching to a different model entirely —
-                        # no reason to wait, it has its own separate
-                        # capacity, try it immediately.
-                        continue
-                    raise
+            prompt = _build_gold_prompt(gold_data)
+            candidates = _available_models(GEMINI_CANDIDATE_MODELS)
+            if not candidates:
+                raise RuntimeError("Every configured Gemini model is currently on cooldown (daily quota exhausted).")
+
+            insights_text, model_used = asyncio.run(_race_gemini_models(prompt, candidates))
 
             _insights_cache["result"] = {
                 "success": True,
@@ -386,7 +468,7 @@ def trigger_insights_update(gold_data):
                 "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "gold_price_at_analysis": gold_data.get("current_price", {}).get("per_ounce_usd"),
             }
-            print(f"Gemini insights generated successfully (attempt {attempt}, model {model_name})")
+            print(f"Gemini insights generated successfully (model {model_used})")
         except Exception as e:
             print(f"Error updating Gemini insights: {e}")
             _insights_cache["result"] = {
