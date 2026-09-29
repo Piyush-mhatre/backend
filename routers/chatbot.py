@@ -39,6 +39,7 @@ AI Financial Advisor chatbot — ported from the original Flask app's
     themselves send unlimited messages.
 """
 
+import re
 from datetime import date
 from typing import List, Literal
 
@@ -73,6 +74,65 @@ SYSTEM_INSTRUCTION = (
     "only. Keep replies reasonably concise; this is a chat interface, not a "
     "long-form article."
 )
+
+# =====================================================================
+# Conversation titles — generated in the SAME call as the first reply
+#
+# The frontend shows a sidebar of separate conversations, each with a
+# short title. Asking Gemini for that title in a second request would
+# double the quota cost of every new chat, and quota is the scarce
+# resource here. Instead, for the first message of a conversation only,
+# the model is asked to put the title on the first line of its reply;
+# _split_title peels it off before the reply goes back to the frontend.
+# If the model ignores the format, title comes back None and the
+# frontend falls back to the first few words of the user's message — so
+# a formatting slip costs nothing but a slightly less polished title.
+# =====================================================================
+TITLE_INSTRUCTION = (
+    " This is the FIRST message of a new conversation. Begin your response "
+    "with a single line in exactly this format: 'TITLE: ' followed by a "
+    "concise 4-7 word plain-text title for the conversation's topic (no "
+    "quotes, no markdown, no trailing period), then a blank line, then your "
+    "normal reply. Never mention or explain the title line."
+)
+
+# Tolerant on purpose: models are told "no markdown" but sometimes bold
+# the label anyway (**TITLE:** ...), wrap the whole line in bold, or
+# prefix it with '#'. If the pattern were strict, those replies would
+# both lose their title AND show the raw "**TITLE:** ..." line to the
+# visitor — so it accepts that decoration, and may appear within the
+# first few lines in case the model adds a short preamble first.
+_TITLE_LINE_RE = re.compile(
+    r"^[ \t]*[*_#>` \t]*TITLE[ \t]*[:\-–—][ \t]*(.+?)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+TITLE_SEARCH_WINDOW_CHARS = 300  # only look near the top of the reply
+MAX_TITLE_WORDS = 8
+MAX_TITLE_CHARS = 60
+
+
+def _clean_title(raw):
+    """Strips markdown/quote noise and enforces length limits, since the
+    model's output is untrusted formatting-wise."""
+    title = re.sub(r"[*_`#\"“”]", "", raw)
+    title = re.sub(r"\s+", " ", title).strip().strip("'").rstrip(".:;,!-– ")
+    title = " ".join(title.split(" ")[:MAX_TITLE_WORDS])[:MAX_TITLE_CHARS].strip()
+    return title or None
+
+
+def _split_title(raw_reply):
+    """Returns (title_or_None, reply_without_title_line). If there's no
+    TITLE line near the top — or removing it would leave an empty reply
+    — returns (None, raw_reply) unchanged rather than risk showing the
+    visitor nothing."""
+    match = _TITLE_LINE_RE.search(raw_reply, 0, TITLE_SEARCH_WINDOW_CHARS)
+    if not match:
+        return None, raw_reply
+    remaining = (raw_reply[:match.start()] + raw_reply[match.end():]).strip()
+    remaining = re.sub(r"\n{3,}", "\n\n", remaining)
+    if not remaining:
+        return None, raw_reply
+    return _clean_title(match.group(1)), remaining
 
 # =====================================================================
 # Per-session daily rate limiting
@@ -175,14 +235,25 @@ async def send_message(payload: ChatRequest):
 
     contents = _build_contents(payload.history, payload.message)
 
+    # An empty history means this is the first message of a brand-new
+    # conversation — the only time a title is needed (see the note above
+    # TITLE_INSTRUCTION for why it rides along with the reply).
+    is_new_conversation = len(payload.history) == 0
+    system_instruction = SYSTEM_INSTRUCTION + (TITLE_INSTRUCTION if is_new_conversation else "")
+
     try:
-        reply_text, model_used = await call_gemini_sequential(contents, candidates, system_instruction=SYSTEM_INSTRUCTION)
+        reply_text, model_used = await call_gemini_sequential(contents, candidates, system_instruction=system_instruction)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Chatbot temporarily unavailable: {e}")
+
+    title = None
+    if is_new_conversation:
+        title, reply_text = _split_title(reply_text)
 
     return {
         "success": True,
         "reply": reply_text,
+        "title": title,
         "model_used": model_used,
         "messages_used_today": messages_used,
         "messages_limit_per_day": limit,
