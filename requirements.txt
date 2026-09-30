@@ -35,3 +35,8 @@ onnxruntime==1.20.1
 # scale memory footprint, but still lazy-imported in gold.py to keep
 # app-boot memory minimal regardless.
 google-genai
+
+# --- investment recommender feature ---
+# Only imported lazily inside routers/fin_invest.py (first request), so it
+# costs nothing at app boot. Pulls in scipy + joblib as dependencies.
+scikit-learn==1.5.2

@@ -24,12 +24,14 @@ from routers import stock_analysis
 from routers import news
 from routers import gold
 from routers import chatbot
+from routers import fin_invest
 
 app = FastAPI(title="Piyush Mhatre — Portfolio Backend", version="0.2.0")
 app.include_router(stock_analysis.router)
 app.include_router(news.router)
 app.include_router(gold.router)
 app.include_router(chatbot.router)
+app.include_router(fin_invest.router)
 
 # =====================================================================
 # CORS — only these origins are allowed to call this API from a browser.
