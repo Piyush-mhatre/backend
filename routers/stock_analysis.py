@@ -37,6 +37,8 @@ import requests
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from .mem_log import log_memory
+
 router = APIRouter()
 
 # =====================================================================
@@ -81,6 +83,7 @@ def _ensure_heavy_libs():
 
     np, pd, yf, plotly, go, make_subplots = _np, _pd, _yf, _plotly, _go, _make_subplots
     _heavy_libs_loaded = True
+    log_memory("stock_analysis: heavy libs imported (numpy, pandas, yfinance, plotly)")
 
 # How much price history to pull for the candlestick chart and the trend/
 # Prophet forecast. The original app fetched candlestick data all the way
@@ -473,6 +476,7 @@ def _prophet_forecast(history_df, company_name, ticker, currency):
 
     model = Prophet(daily_seasonality=True)  # new instance every call, on purpose
     model.fit(dfx)
+    log_memory("stock_analysis: Prophet model fit complete")
 
     future_periods = 365
     future_forecast = model.make_future_dataframe(periods=future_periods)
@@ -989,10 +993,13 @@ def analyze(payload: StockAnalyzeRequest):
         if history_df.empty:
             raise HTTPException(status_code=404, detail=f"No usable price data for ticker '{ticker}'")
 
+        log_memory(f"stock_analysis: price history fetched for {ticker}")
+
         piotroski_results = analyze_piotroski(stock, ticker)
         forecast_results = forecast_stock(stock, history_df, ticker)
         candlestick_results = analyze_candlestick_and_info(stock, history_df, ticker)
         sector_results = analyze_sector_performance(stock, ticker)
+        log_memory(f"stock_analysis: /analyze full pipeline completed for {ticker}")
     except HTTPException:
         raise
     except Exception as e:

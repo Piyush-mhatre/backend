@@ -8,6 +8,8 @@ import onnxruntime as ort
 from fastapi import APIRouter, HTTPException
 from transformers import AutoTokenizer
 
+from .mem_log import log_memory
+
 router = APIRouter(
     prefix="/news",
     tags=["News"]
@@ -109,6 +111,7 @@ def load_finbert_model():
         tokenizer = AutoTokenizer.from_pretrained(
             TOKENIZER_DIR
         )
+        log_memory("news: FinBERT tokenizer loaded")
 
         # Load the ONNX Runtime session directly — no torch, no fp32
         # architecture build, no quantize_dynamic call. onnxruntime's own
@@ -134,6 +137,7 @@ def load_finbert_model():
         )
 
         model_ready = True
+        log_memory("news: ONNX INT8 session initialized")
 
         print("INT8 FinBERT (ONNX) model loaded successfully!")
 
@@ -327,6 +331,7 @@ def get_news_with_sentiment(keyword):
                 ) or "https://via.placeholder.com/300"
             })
 
+        log_memory("news: sentiment batch classification finished")
         return news
 
     except requests.RequestException as e:
@@ -370,6 +375,7 @@ def get_news(keyword: str):
             keyword.strip()
         )
 
+        log_memory("news: /news/{keyword} completed")
         return {
             "keyword": keyword.strip(),
             "count": len(news),

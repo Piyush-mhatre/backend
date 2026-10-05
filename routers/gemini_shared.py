@@ -40,6 +40,8 @@ import os
 import re
 import time
 
+from .mem_log import log_memory
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Ordered by preference, based on (a) this project's own rate-limit
@@ -117,6 +119,7 @@ async def race_gemini_models(contents, models, system_instruction=None):
     responds first with a success. Raises if every model in every batch
     fails or times out."""
     from google import genai  # lazy import — only paid for when a Gemini feature is actually hit
+    log_memory("gemini_shared: google.genai imported for race")
 
     last_errors = []
 
@@ -169,6 +172,7 @@ async def call_gemini_sequential(contents, models, system_instruction=None):
     (like a chat, where a single conversation can be dozens of
     messages), as opposed to gold.py's occasional background refresh."""
     from google import genai  # lazy import
+    log_memory("gemini_shared: google.genai imported for sequential")
 
     last_errors = []
 

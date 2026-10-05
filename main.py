@@ -25,6 +25,7 @@ from routers import news
 from routers import gold
 from routers import chatbot
 from routers import fin_invest
+from routers.mem_log import log_memory
 
 app = FastAPI(title="Piyush Mhatre — Portfolio Backend", version="0.2.0")
 app.include_router(stock_analysis.router)
@@ -32,6 +33,8 @@ app.include_router(news.router)
 app.include_router(gold.router)
 app.include_router(chatbot.router)
 app.include_router(fin_invest.router)
+
+log_memory("main.py: App boot & routers mounted")
 
 # =====================================================================
 # CORS — only these origins are allowed to call this API from a browser.
@@ -217,6 +220,7 @@ def prewarm_forecast_engine():
         try:
             from prophet import Prophet  # noqa: F401 — import side-effect is the point
             print("Prophet pre-imported at startup (FORECAST_ENGINE=prophet)")
+            log_memory("main.py: Prophet pre-warm finished")
         except Exception as e:
             print(f"Prophet pre-warm failed: {e}")
 
@@ -230,6 +234,7 @@ def prewarm_finbert():
     once here — it spins up load_finbert_model() on its own daemon
     thread and is a no-op if called again while already loading/loaded."""
     news.start_model_loading()
+    log_memory("main.py: FinBERT prewarm kicked off")
 
 
 @app.get("/health")
@@ -249,6 +254,7 @@ def calculate(payload: FinPlanRequest):
             payload.salaryGrowth,
             payload.investmentPercentage,
         )
+        log_memory("main.py: after /calculate")
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

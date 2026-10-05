@@ -47,6 +47,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from .gemini_shared import GEMINI_API_KEY, GEMINI_CANDIDATE_MODELS, available_models, call_gemini_sequential
+from .mem_log import log_memory
 
 router = APIRouter(prefix="/chatbot", tags=["Chatbot"])
 
@@ -243,6 +244,7 @@ async def send_message(payload: ChatRequest):
 
     try:
         reply_text, model_used = await call_gemini_sequential(contents, candidates, system_instruction=system_instruction)
+        log_memory("chatbot: Gemini response received")
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Chatbot temporarily unavailable: {e}")
 

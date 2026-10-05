@@ -25,6 +25,8 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from .mem_log import log_memory
+
 router = APIRouter(prefix="/investment", tags=["Investment Recommender"])
 
 _COLUMNS = ("name", "return_rate", "risk_level", "tax_benefits", "liquidity", "min_duration", "description")
@@ -66,6 +68,7 @@ def _get_clf():
         X = np.array([_features(o["risk_level"], o["tax_benefits"], o["liquidity"], o["min_duration"]) for o in OPTIONS])
         y = np.arange(len(OPTIONS))  # target = row index, exactly like the original
         _clf = DecisionTreeClassifier(random_state=42).fit(X, y)
+        log_memory("fin_invest: Scikit-learn imported & DecisionTree fitted")
     return _clf
 
 
@@ -133,6 +136,7 @@ def recommend(payload: RecommendRequest):
             alt_idx += _fallback_alternatives(
                 alt_idx + [best], TAX[payload.tax], RISK[payload.risk], 3 - len(alt_idx))
 
+        log_memory("fin_invest: /investment/recommend completed")
         return {
             "profile": {
                 "risk_tolerance": payload.risk.capitalize(),

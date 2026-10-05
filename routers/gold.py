@@ -55,6 +55,7 @@ from .gemini_shared import (
     available_models,
     race_gemini_models,
 )
+from .mem_log import log_memory
 
 router = APIRouter(prefix="/gold", tags=["Gold"])
 
@@ -78,6 +79,7 @@ def _ensure_yfinance():
     import yfinance as _yf
     yf = _yf
     _yf_loaded = True
+    log_memory("gold: yfinance imported")
 
 
 
@@ -258,6 +260,7 @@ def get_gold_data(force_refresh=False):
 
     _gold_cache["data"] = response_data
     _gold_cache["fetched_at"] = now
+    log_memory("gold: price & exchange data processed")
     return response_data, True, True
 
 
@@ -317,6 +320,7 @@ def trigger_insights_update(gold_data):
                 "gold_price_at_analysis": gold_data.get("current_price", {}).get("per_ounce_usd"),
             }
             print(f"Gemini insights generated successfully (model {model_used})")
+            log_memory("gold: Gemini insights generated")
         except Exception as e:
             print(f"Error updating Gemini insights: {e}")
             _insights_cache["result"] = {
@@ -352,6 +356,7 @@ def gold_price(refresh: bool = Query(False, description="Force a fresh fetch, by
         if is_fresh or _insights_cache["result"] is None:
             trigger_insights_update(data)
 
+    log_memory("gold: /gold/price completed")
     return data
 
 
