@@ -369,6 +369,13 @@ def get_news(keyword: str):
             detail="Keyword cannot be empty."
         )
 
+    # Lazy trigger: FinBERT now loads on first real /news hit instead of
+    # unconditionally at every boot (moved out of main.py's old
+    # prewarm_finbert startup hook) — it's a ~230MB ONNX session, no
+    # reason to pay that for every visitor when most sessions may never
+    # touch this feature. No-ops instantly if already loading/loaded.
+    start_model_loading()
+
     try:
 
         news = get_news_with_sentiment(
