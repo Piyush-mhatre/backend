@@ -2,11 +2,8 @@ import os
 import random
 import threading
 
-import numpy as np
 import requests
-import onnxruntime as ort
 from fastapi import APIRouter, HTTPException
-from transformers import AutoTokenizer
 
 from .mem_log import log_memory
 
@@ -66,6 +63,22 @@ PREFERRED_DOMAINS = []  # e.g. ["reuters.com", "moneycontrol.com", "livemint.com
 
 tokenizer = None
 model = None  # an onnxruntime.InferenceSession once loaded
+np = None
+ort = None
+AutoTokenizer = None
+_finbert_libs_loaded = False
+
+
+def _ensure_finbert_libs():
+    global np, ort, AutoTokenizer, _finbert_libs_loaded
+    if _finbert_libs_loaded:
+        return
+    import numpy as _np
+    import onnxruntime as _ort
+    from transformers import AutoTokenizer as _AutoTokenizer
+
+    np, ort, AutoTokenizer = _np, _ort, _AutoTokenizer
+    _finbert_libs_loaded = True
 
 model_loading = False
 model_ready = False
@@ -102,6 +115,7 @@ def load_finbert_model():
     print("Loading INT8 FinBERT model...")
 
     try:
+        _ensure_finbert_libs()
         # Load from local files committed to the repo — no Hugging Face
         # network call at boot at all (this used to hit HF for the
         # tokenizer every cold start; now it's just reading small local
@@ -157,7 +171,7 @@ def predict_sentiment(text):
     global model
     global tokenizer
 
-    if not model_ready:
+    if not model_ready or np is None:
         return "neutral"
 
     if not text:
